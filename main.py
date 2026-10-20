@@ -1369,6 +1369,20 @@ def crossfade_window(root, change, ms=THEME_FADE_MS):
     fade.animate_to(1.0, ms, ease_in_out, on_done=cover.destroy)
 
 
+def paint_now(widget):
+    """Windows only: handle pending paint messages right away.
+
+    Windows paints uncovered areas only when nothing else is queued, so while a panel slides open the
+    newly uncovered strip keeps showing stale pixels (whatever used to be there) for a frame or more.
+    X11/Wayland compositors keep each window's contents, so elsewhere this is a no-op. Callers must
+    cope with re-entrancy: update() can run other events, e.g. a click that restarts the animation."""
+    if sys.platform == "win32":
+        try:
+            widget.update()
+        except tk.TclError:
+            pass
+
+
 class Animation:
     """A value tweened over time with Tk's after(), in the spirit of Chromium's gfx::SlideAnimation.
 
@@ -1379,6 +1393,7 @@ class Animation:
     def __init__(self, widget, on_step, value=0.0):
         self.widget, self.on_step, self.value = widget, on_step, value
         self._job = None
+        self._generation = 0  # bumped by cancel(); a frame from an older run stops itself
 
     @property
     def running(self):
@@ -1395,11 +1410,14 @@ class Animation:
             return
         duration = ms / 1000 * (span if proportional else 1)
         t0 = time.perf_counter()
+        generation = self._generation
 
         def frame():
+            if generation != self._generation:
+                return  # superseded by a newer animate_to/cancel (possibly during paint_now)
             self._job = None
             t = min(1.0, (time.perf_counter() - t0) / duration)
-            if not self._step(start + (target - start) * ease(t)):
+            if not self._step(start + (target - start) * ease(t)) or generation != self._generation:
                 return
             if t < 1:
                 self._job = self.widget.after(ANIM_FRAME_MS, frame)
@@ -1420,6 +1438,7 @@ class Animation:
             return False
 
     def cancel(self):
+        self._generation += 1
         if self._job:
             try:
                 self.widget.after_cancel(self._job)
@@ -1993,6 +2012,7 @@ class GlideTabview(ctk.CTkFrame if ctk else object):
             return
         _, new, d, width = self._sliding
         new.place(x=d * (width - round(width * v)), y=0, relwidth=1, relheight=1)
+        paint_now(self)  # Windows: paint the page as it is uncovered, not a frame later
 
     def _end_slide(self):
         if self._sliding:
@@ -2425,13 +2445,19 @@ class UltraCalc(ctk.CTk if ctk else object):
             return
         start, t0 = self._sci_p, time.perf_counter()
         duration = SCI_ANIM_MS / 1000 * abs(target - start)  # reversing mid-way takes only the rest
+        self._sci_generation += 1
+        generation = self._sci_generation
 
         def frame():
+            if generation != self._sci_generation:
+                return  # a newer toggle took over (e.g. a click handled inside paint_now)
             t = min(1.0, (time.perf_counter() - t0) / duration) if duration > 0 else 1.0
             # opening swoops in (fast, then settles); closing eases in and out
             eased = 1 - (1 - t) ** 3 if open_ else t * t * (3 - 2 * t)
             self._set_sci_progress(start + (target - start) * eased)
-            self._sci_job = self.after(ANIM_FRAME_MS, frame) if t < 1 else None
+            paint_now(self)  # Windows: paint the newly uncovered strip now, not a frame later
+            if generation == self._sci_generation:
+                self._sci_job = self.after(ANIM_FRAME_MS, frame) if t < 1 else None
         frame()
 
     def _set_sci_progress(self, p):
@@ -2519,7 +2545,7 @@ class UltraCalc(ctk.CTk if ctk else object):
             self._btn(mem, txt, cmd, 0, c, "mem")
 
         # scientific block, inside a clip whose height is animated (see set_scientific)
-        self._sci_open, self._sci_p, self._sci_job = True, 1.0, None
+        self._sci_open, self._sci_p, self._sci_job, self._sci_generation = True, 1.0, None, 0
         self.sci_clip = ctk.CTkFrame(pad, fg_color="transparent", corner_radius=0, height=SCI_PANEL_H)
         self.sci_clip.grid(row=1, column=0, sticky="ew")
         self.sci_frame = ctk.CTkFrame(self.sci_clip, fg_color="transparent", corner_radius=0)
