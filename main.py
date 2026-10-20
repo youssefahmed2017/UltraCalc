@@ -1052,6 +1052,300 @@ def calc(expr: str, *, deg: bool = True, **names: Number) -> Number:
 # --------------------------------------------------------------------------- #
 #  Graph helpers
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+#  Vectorised evaluation and 3D meshes (NumPy)
+# --------------------------------------------------------------------------- #
+def _vector_funcs(np):
+    from functools import reduce
+
+    def fold(op):
+        return lambda *args: reduce(op, args)
+    return {
+        "sin": np.sin, "cos": np.cos, "tan": np.tan, "asin": np.arcsin, "acos": np.arccos, "atan": np.arctan,
+        "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh, "sqrt": np.sqrt, "cbrt": np.cbrt, "abs": np.abs,
+        "log": np.log10, "ln": np.log, "log2": np.log2, "exp": np.exp, "floor": np.floor, "ceil": np.ceil,
+        "sign": np.sign, "hypot": np.hypot, "rad": np.radians, "deg": np.degrees, "pow": np.power,
+        "logb": lambda x, b: np.log(x) / np.log(b),
+        "root": lambda x, n: np.where((x < 0) & (np.mod(n, 2) == 0), np.nan, np.sign(x) * np.abs(x) ** (1.0 / n)),
+        # element-wise min/max: union and intersection when building shapes from implicit surfaces
+        "min": fold(np.minimum), "max": fold(np.maximum), "sum": fold(np.add),
+        "mean": lambda *args: reduce(np.add, args) / len(args),
+    }
+
+
+def compile_vector(engine, expr, params):
+    """Compile ``expr`` to work on whole NumPy arrays at once (graphs need 10^4-10^6 points).
+
+    The expression first goes through the normal compiler, so syntax and error messages are the
+    calculator's own. Trig is in radians; undefined points come out as NaN. Functions without a
+    NumPy version (fact, ncr, ...) fall back to the scalar engine point by point, which is slow but
+    still correct."""
+    import numpy as np
+    engine.compile(expr, params)  # validation only
+    fn = _vector_build(engine, ast.parse(engine.prepare(expr), mode="eval").body, frozenset(params), np,
+                       _vector_funcs(np))
+
+    def run(scope):
+        with np.errstate(all="ignore"):
+            out = np.asarray(fn(scope), dtype=float)
+        return np.where(np.isfinite(out), out, np.nan)  # like the calculator: 1/0 and log(0) are undefined, not ±inf
+    return run
+
+
+def _vector_build(engine, n, params, np, vfuncs):
+    build = lambda node: _vector_build(engine, node, params, np, vfuncs)
+    if isinstance(n, ast.Constant):
+        value = float(n.value)
+        return lambda s: value
+    if isinstance(n, ast.BinOp):
+        left, right = build(n.left), build(n.right)
+        op = {ast.Add: np.add, ast.Sub: np.subtract, ast.Mult: np.multiply, ast.Div: np.true_divide,
+              ast.FloorDiv: np.floor_divide, ast.Mod: np.mod, ast.Pow: np.power}[type(n.op)]
+        return lambda s: op(left(s), right(s))
+    if isinstance(n, ast.UnaryOp):
+        operand = build(n.operand)
+        return (lambda s: np.negative(operand(s))) if isinstance(n.op, ast.USub) else operand
+    if isinstance(n, ast.Name):
+        k = n.id
+        if k in params:
+            return lambda s: s[k]
+        if k in CONSTS:
+            value = CONSTS[k]
+            return lambda s: value
+        if k in ("ans", "m"):
+            return lambda s: _as_float(engine.ans if k == "ans" else engine.memory)
+
+        def var(s):
+            if k not in engine.vars:
+                raise CalcError(f"Unknown name '{k}'")
+            return _as_float(engine.vars[k])
+        return var
+    # a call (validated already): built-in, user function, implicit multiplication, or scalar fallback
+    name, args = n.func.id, [build(a) for a in n.args]
+    if name in vfuncs:
+        f = vfuncs[name]
+        return lambda s: f(*[a(s) for a in args])
+    if name in engine.user_funcs:
+        uf = engine.user_funcs[name]
+        body = compile_vector(engine, uf.body, uf.params)
+        return lambda s: body(dict(zip(uf.params, [a(s) for a in args])))
+    if name not in engine.funcs:  # pi(2), a(x+1): multiplication
+        base = build(ast.Name(id=name))
+        return lambda s: np.multiply(base(s), args[0](s))
+    scalar = engine.funcs[name]
+
+    def safe(*values):
+        try:
+            return float(scalar(*values))
+        except Exception:
+            return math.nan
+    vectorised = np.vectorize(safe, otypes=[float])
+    return lambda s: vectorised(*[a(s) for a in args])
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except OverflowError:
+        return math.inf
+
+
+def _clean_mesh(np, vertices, faces):
+    """Drop triangles touching undefined points, then drop vertices no triangle uses."""
+    ok = np.isfinite(vertices).all(axis=1)
+    faces = faces[ok[faces].all(axis=1)]
+    if not len(faces):
+        raise CalcError("The shape is undefined everywhere in this range")
+    used, remap = np.unique(faces, return_inverse=True)
+    return vertices[used], remap.reshape(faces.shape).astype(np.uint32)
+
+
+def _grid_faces(np, rows, cols):
+    i, j = np.meshgrid(np.arange(rows - 1), np.arange(cols - 1), indexing="ij")
+    a = (i * cols + j).ravel()
+    b, c = a + cols, a + 1
+    return np.concatenate([np.stack([a, b, b + 1], 1), np.stack([a, b + 1, c], 1)])
+
+
+@dataclass
+class MeshPart:
+    """One surface of a 3D plot. ``rgba`` None means 'colour by height' (a single plain surface);
+    ``vertex_colors`` (per-vertex RGBA) is used instead when parts are joined into one solid."""
+    vertices: object
+    faces: object
+    rgba: tuple | None = None
+    alpha: float = 1.0
+    vertex_colors: object = None
+
+
+def styled_parts(src):
+    """'expr @style; expr @style; …' -> [(expr, style)]. A style is a colour and/or an opacity: '@pink 40%'."""
+    parts = []
+    for chunk in src.split(";"):
+        expr, _, style = chunk.partition("@")
+        if expr.strip():
+            parts.append((expr.strip(), style.strip()))
+        elif style.strip():
+            raise CalcError("A colour needs a shape before it, like  x^2 + y^2 + z^2 = 1 @pink")
+    if not parts:
+        raise CalcError("Type something to plot")
+    return parts
+
+
+def parse_style(style, index, count):
+    """'pink 40%' -> ((r, g, b, a) or None, a). No colour: height colouring for a lone surface,
+    otherwise the next colour of the graph palette, so several surfaces are told apart."""
+    color, alpha = None, 1.0
+    for token in style.split():
+        if token.endswith("%"):
+            try:
+                alpha = min(1.0, max(0.05, float(token[:-1]) / 100))
+            except ValueError:
+                raise CalcError(f"'{token}' isn't an opacity: use something like 40%") from None
+        elif color is None:
+            color = token
+        else:
+            raise CalcError(f"Two colours for one surface: '{color}' and '{token}'")
+    if color is None:
+        if count == 1:
+            return None, alpha
+        color = GRAPH_COLORS[index % len(GRAPH_COLORS)]
+    from matplotlib.colors import to_rgba
+    try:
+        r, g, b, _ = to_rgba(color)
+    except ValueError:
+        raise CalcError(f"Unknown colour '{color}': use a name like pink or tan, or #ff69b4") from None
+    return (r, g, b, alpha), alpha
+
+
+def heightmap_mesh(engine, src, x0, x1, y0, y1, n=150):
+    """z = f(x, y) as a triangle mesh; spikes near asymptotes are cut out. Returns (vertices, faces, (lo, hi))."""
+    import numpy as np
+    X, Y = np.meshgrid(np.linspace(x0, x1, n), np.linspace(y0, y1, n), indexing="ij")
+    Z = np.broadcast_to(compile_vector(engine, src, ("x", "y"))({"x": X, "y": Y}), X.shape).copy()
+    finite = Z[np.isfinite(Z)]
+    if not finite.size:
+        raise CalcError("z(x, y) is undefined everywhere in this range")
+    lo, hi = (float(v) for v in np.percentile(finite, [1, 99]))
+    if hi - lo < 1e-9:
+        lo, hi = lo - 1, hi + 1
+    span = hi - lo
+    Z[(Z < lo - span) | (Z > hi + span)] = np.nan  # cut off spikes near asymptotes
+    vertices = np.stack([X.ravel(), Y.ravel(), np.clip(Z, lo - span * 0.1, hi + span * 0.1).ravel()], 1)
+    return (*_clean_mesh(np, vertices, _grid_faces(np, n, n)), (lo, hi))
+
+
+def heightmap_parts(engine, src, x0, x1, y0, y1, n=150):
+    """One or more height maps  'z1 @style; z2 @style'  -> ([MeshPart], combined (lo, hi) for colouring)."""
+    parts, lows, highs = [], [], []
+    styled = styled_parts(src)
+    for i, (expr, style) in enumerate(styled):
+        rgba, alpha = parse_style(style, i, len(styled))
+        vertices, faces, (lo, hi) = heightmap_mesh(engine, re.sub(r"^\s*z\s*=\s*", "", expr), x0, x1, y0, y1, n)
+        parts.append(MeshPart(vertices, faces, rgba, alpha))
+        lows.append(lo)
+        highs.append(hi)
+    return parts, (min(lows), max(highs))
+
+
+def surface_mesh(engine, src, u0, u1, v0, v1, n=160):
+    """Parametric surface  x(u,v), y(u,v), z(u,v)  as a triangle mesh: spheres, tori, shells, Klein bottles..."""
+    import numpy as np
+    parts = split_numbers(src)
+    if len(parts) != 3:
+        raise CalcError("Write the surface as   x(u,v), y(u,v), z(u,v)")
+    U, V = np.meshgrid(np.linspace(u0, u1, n), np.linspace(v0, v1, n), indexing="ij")
+    scope = {"u": U, "v": V}
+    xyz = [np.broadcast_to(compile_vector(engine, p, ("u", "v"))(scope), U.shape).ravel() for p in parts]
+    return _clean_mesh(np, np.stack(xyz, 1), _grid_faces(np, n, n))
+
+
+def surface_parts(engine, src, u0, u1, v0, v1, n=160):
+    """One or more (u, v) surfaces  'x, y, z @style; x, y, z @style'  -> [MeshPart]."""
+    styled = styled_parts(src)
+    return [MeshPart(*surface_mesh(engine, expr, u0, u1, v0, v1, n), *parse_style(style, i, len(styled)))
+            for i, (expr, style) in enumerate(styled)]
+
+
+def implicit_function(src):
+    """'lhs = rhs' -> 'lhs - (rhs)'; a lone expression is taken as  F = 0."""
+    sides = src.split("=")
+    if len(sides) > 2 or any(not s.strip() for s in sides):
+        raise CalcError("Write the surface as  F(x, y, z) = 0  or  left side = right side")
+    return sides[0] if len(sides) == 1 else f"({sides[0]}) - ({sides[1]})"
+
+
+def _marching_cubes(np, field, lo, hi, n):
+    from vispy.geometry.isosurface import isosurface
+    with np.errstate(all="ignore"):  # VisPy's index arithmetic warns harmlessly on NumPy 2
+        vertices, faces = isosurface(field, 0.0)
+    return lo + vertices * (hi - lo) / (n - 1), faces.astype(np.uint32)
+
+
+def implicit_parts(engine, src, lo, hi, n=72, join=False):
+    """Implicit surfaces  'F1 = 0 @style; F2 = 0 @style'  inside the cube [lo, hi]^3 (marching cubes).
+
+    By default every part is its own surface, so surfaces pass through each other and their
+    intersections stay visible. With ``join`` the parts become one solid (the minimum of their F),
+    each point coloured by the part it lies on: modelling, e.g. icing on a donut."""
+    import numpy as np
+    styled = styled_parts(src)
+    styles = [parse_style(style, i, len(styled)) for i, (_, style) in enumerate(styled)]  # check before heavy work
+    fns = [compile_vector(engine, implicit_function(expr), ("x", "y", "z")) for expr, _ in styled]
+    g = np.linspace(lo, hi, n)
+    X, Y, Z = np.meshgrid(g, g, g, indexing="ij")
+    fields = []
+    for fn in fns:
+        values = np.broadcast_to(fn({"x": X, "y": Y, "z": Z}), X.shape)
+        fields.append(np.where(np.isfinite(values), values, 1e9))  # undefined points count as outside
+    crosses = lambda field: (field < 0).any() and (field > 0).any()
+    if join and len(styled) > 1:
+        F = np.minimum.reduce(fields)
+        if not crosses(F):
+            raise CalcError("The surface doesn't pass through this box: try a bigger range")
+        vertices, faces = _marching_cubes(np, F, lo, hi, n)
+        at = {"x": vertices[:, 0], "y": vertices[:, 1], "z": vertices[:, 2]}
+        owner = np.stack([np.nan_to_num(np.broadcast_to(fn(at), (len(vertices),)), nan=np.inf) for fn in fns],
+                         1).argmin(1)
+        return [MeshPart(vertices, faces, vertex_colors=np.array([rgba for rgba, _ in styles], np.float32)[owner])]
+    parts = [MeshPart(*_marching_cubes(np, field, lo, hi, n), *style)
+             for field, style in zip(fields, styles) if crosses(field)]
+    if not parts:
+        raise CalcError("The surface doesn't pass through this box: try a bigger range")
+    return parts
+
+
+def _restore_depth_writes(canvas):
+    """See-through surfaces are drawn with depth writes off and are drawn last, so OpenGL would start
+    the next frame with depth writes still off. glClear then can't clear the depth buffer, and every
+    3D object fails the depth test against stale values: the whole 3D view randomly blanks. Turn depth
+    writes back on before each frame's clear."""
+    canvas.events.draw.connect(lambda event: canvas.context.set_depth_mask(True), position="first")
+
+
+def merge_parts(parts):
+    """All parts as one (vertices, faces) mesh, e.g. for STL export."""
+    import numpy as np
+    offsets = np.cumsum([0] + [len(p.vertices) for p in parts[:-1]])
+    return (np.concatenate([p.vertices for p in parts]),
+            np.concatenate([p.faces + off for p, off in zip(parts, offsets)]).astype(np.uint32))
+
+
+def write_stl(path, vertices, faces):
+    """Binary STL: the standard 3D-printing / 3D-modelling exchange format."""
+    import numpy as np
+    tri = vertices[faces].astype(np.float32)
+    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    length = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.divide(normals, length, out=np.zeros_like(normals), where=length > 0)
+    records = np.zeros(len(faces), dtype=[("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attr", "<u2")])
+    records["normal"], records["vertices"] = normals, tri
+    with open(path, "wb") as f:
+        f.write(b"UltraCalc mesh".ljust(80, b" "))
+        f.write(np.uint32(len(faces)).tobytes())
+        f.write(records.tobytes())
+
+
 def _preload_matplotlib():
     try:  # only the GUI-free parts; the Tk backend is imported on the main thread when needed
         import matplotlib.backends.backend_agg  # noqa: F401
@@ -1098,12 +1392,54 @@ GRAPH_MODES = {
                  "Spirograph": ("cos(t) + cos(6t)/2 + sin(14t)/3, sin(t) + sin(6t)/2 + cos(14t)/3", TWO_PI)}),
     "3D": dict(
         label="z(x, y) =", fields=("xmin", "xmax", "ymin", "ymax"), defaults=("-8", "8", "-8", "8"),
-        expr="sin(sqrt(x^2 + y^2))", projection="3d", draw="_draw_surface",
-        info="One surface z(x, y). Drag to rotate, right-drag to zoom.",
+        expr="sin(sqrt(x^2 + y^2))", projection="3d", draw="_draw_3d_mpl", mesh="_mesh_heightmap",
+        info="z(x, y); several surfaces with ';', styled like  @orange 50%. Drag to rotate, right-drag to zoom. "
+             "Save… exports STL.",
         presets={"Ripple": ("sin(sqrt(x^2 + y^2))", ("-10", "10", "-10", "10")),
+                 "Tangent plane": ("x^2 - y^2 @royalblue; 0.75 + 2(x - 1) - (y - 0.5) @orange 55%", ("-2", "2", "-2", "2")),
                  "Saddle": ("x^2 - y^2", ("-3", "3", "-3", "3")), "Egg crate": ("sin(x)*cos(y)", ("-6", "6", "-6", "6")),
                  "Gaussian hill": ("4exp(-(x^2 + y^2)/6)", ("-6", "6", "-6", "6")),
                  "Monkey saddle": ("x^3 - 3x*y^2", ("-2", "2", "-2", "2"))}),
+    "Surface": dict(
+        label="x, y, z (u, v) =", fields=("u from", "u to", "v from", "v to"), defaults=(*TWO_PI, *TWO_PI),
+        expr="(2 + cos(v))cos(u), (2 + cos(v))sin(u), sin(v)", projection="3d", draw="_draw_3d_mpl",
+        mesh="_mesh_param_surface",
+        info="x(u,v), y(u,v), z(u,v); several surfaces with ';', styled like  @gold 40%. Drag to rotate. "
+             "Save… exports STL.",
+        presets={"Torus": ("(2 + cos(v))cos(u), (2 + cos(v))sin(u), sin(v)", (*TWO_PI, *TWO_PI)),
+                 "Sphere in torus": ("(2 + cos(v))cos(u), (2 + cos(v))sin(u), sin(v) @deepskyblue 35%; "
+                                     "1.4cos(u)sin(v/2), 1.4sin(u)sin(v/2), 1.4cos(v/2) @tomato", (*TWO_PI, *TWO_PI)),
+                 "Sphere": ("cos(u)sin(v), sin(u)sin(v), cos(v)", (*TWO_PI, "0", "pi")),
+                 "Seashell": ("2(1 - exp(u/(6pi)))cos(u)cos(v/2)^2, 2(exp(u/(6pi)) - 1)sin(u)cos(v/2)^2, "
+                              "1 - exp(u/(3pi)) - sin(v) + exp(u/(6pi))sin(v)", ("0", "6pi", *TWO_PI)),
+                 "Klein bottle": ("(2 + cos(u/2)sin(v) - sin(u/2)sin(2v))cos(u), "
+                                  "(2 + cos(u/2)sin(v) - sin(u/2)sin(2v))sin(u), sin(u/2)sin(v) + cos(u/2)sin(2v)",
+                                  (*TWO_PI, *TWO_PI)),
+                 "Möbius strip": ("(1 + v/2 cos(u/2))cos(u), (1 + v/2 cos(u/2))sin(u), v/2 sin(u/2)",
+                                  (*TWO_PI, "-1", "1")),
+                 "Spiral horn": ("(1 + 0.2v)cos(v)(1 + 0.3cos(u)), (1 + 0.2v)sin(v)(1 + 0.3cos(u)), 0.4v + 0.3sin(u)",
+                                 ("0", "2pi", "0", "6pi"))}),
+    "Implicit": dict(
+        label="F(x, y, z) =", fields=("box from", "box to", "detail"), defaults=("-2", "2", "72", ""),
+        expr="x^2 + y^2 + z^2 = 1", projection="3d", draw="_draw_3d_mpl", mesh="_mesh_implicit",
+        info="F(x, y, z) = 0; several surfaces with ';', styled like  @pink 40%. min/max join and carve shapes; "
+             "'join parts' merges surfaces into one solid. Save… exports STL.",
+        presets={"Iced donut": ("sqrt((sqrt(x^2 + y^2) - 1)^2 + z^2) - 0.45 @burlywood; "
+                                "max(sqrt((sqrt(x^2 + y^2) - 1)^2 + z^2) - 0.52, 0.05 - z + 0.12sin(6x)cos(6y)) @hotpink",
+                                ("-1.7", "1.7", "110")),
+                 "Sphere": ("x^2 + y^2 + z^2 = 1", ("-1.5", "1.5", "72")),
+                 "Sphere cut by plane": ("x^2 + y^2 + z^2 = 1 @royalblue 45%; z = 0.4x + 0.25 @orange", ("-1.4", "1.4", "96")),
+                 "Level sets": ("x^2 + y^2 + z^2 = 0.5 @tomato; x^2 + y^2 + z^2 = 1.2 @gold 45%; "
+                                "x^2 + y^2 + z^2 = 2.2 @deepskyblue 20%", ("-1.6", "1.6", "80")),
+                 "Torus": ("(sqrt(x^2 + y^2) - 1.2)^2 + z^2 = 0.2", ("-2", "2", "80")),
+                 "Heart": ("(x^2 + 9/4y^2 + z^2 - 1)^3 - x^2 z^3 - 9/80y^2 z^3 = 0", ("-1.5", "1.5", "96")),
+                 "Gyroid": ("sin(x)cos(y) + sin(y)cos(z) + sin(z)cos(x) = 0", ("-5", "5", "96")),
+                 "Metaballs": ("1/((x - 0.8)^2 + y^2 + z^2) + 1/((x + 0.8)^2 + y^2 + z^2) + 1/(x^2 + (y - 0.9)^2 + z^2) = 3",
+                               ("-2.2", "2.2", "80")),
+                 # cube ∩ sphere, minus three cylinders: the classic constructive-solid-geometry example
+                 "Carved cube": ("max(max(abs(x), abs(y), abs(z)) - 1, sqrt(x^2 + y^2 + z^2) - 1.35, "
+                                 "0.55 - min(sqrt(y^2 + z^2), sqrt(x^2 + z^2), sqrt(x^2 + y^2))) = 0",
+                                 ("-1.6", "1.6", "96"))}),
 }
 
 
@@ -2379,6 +2715,9 @@ class UltraCalc(ctk.CTk if ctk else object):
                   "  Polar:       r(θ) = cos(4θ)      write θ as θ, theta or t",
                   "  Parametric:  x(t), y(t) = sin(3t), sin(2t)      ';' between curves",
                   "  3D:          z(x, y) = sin(x)*cos(y)      drag = rotate, right-drag = zoom",
+                  "  Surface:     x, y, z (u, v) = cos(u)sin(v), sin(u)sin(v), cos(v)      (a sphere)",
+                  "  Implicit:    x^2 + y^2 + z^2 = 1      min(A, B) = join, max(A, B) = overlap, max(A, -B) = carve",
+                  "  3D shapes save as STL models (Save… / Ctrl+S) for Blender, 3D printing or CAD",
                   "  your own functions work in every mode: f(x)"]
         box.insert("1.0", "\n".join(lines))
         box.configure(state="disabled")
@@ -2968,12 +3307,15 @@ class UltraCalc(ctk.CTk if ctk else object):
         # log scales (y = f(x) mode only; shown/hidden by _set_graph_mode)
         self.g_logx = GlideSwitch(row2, text="log x", width=64, switch_width=32, command=self._toggle_log)
         self.g_logy = GlideSwitch(row2, text="log y", width=64, switch_width=32, command=self._toggle_log)
+        # Implicit mode: join all parts into one solid (modelling) instead of separate surfaces (maths)
+        self.g_join = GlideSwitch(row2, text="join parts", width=96, switch_width=32, command=self.plot)
         self.g_info = ctk.CTkLabel(t, text="", text_color=MUTED, anchor="w")
         self.g_info.pack(fill="x", padx=12)
         # the plot itself is Matplotlib, created the first time the Graph tab is shown
         self.g_host = ctk.CTkFrame(t, fg_color="transparent", corner_radius=0)
         self.g_host.pack(fill="both", expand=True, padx=8, pady=8)
         self._mpl = None
+        self._mesh = None        # (vertices, faces) of the 3D shape on screen, for STL export
         self._gl = None          # GPU 3D view, created on first use (False if OpenGL isn't available)
         self._graph_kind = None  # which widget is showing: "mpl" or "gl"
         self._g_mode = None
@@ -2993,7 +3335,7 @@ class UltraCalc(ctk.CTk if ctk else object):
             self._g_saved[self._g_mode] = {"expr": self.g_f.get(), "range": [self.g_vals[k].get() for k in RANGE_KEYS]}
             # switching between the OpenGL and Matplotlib views swaps the whole picture: dissolve it instead.
             # Build the GPU view first (invisible until shown) so the blend's hold only covers the first frame.
-            gpu_next = GRAPH_MODES[mode]["draw"] == "_draw_surface" and self.tabs.get() == "Graph" and bool(self._ensure_gl())
+            gpu_next = "mesh" in GRAPH_MODES[mode] and self.tabs.get() == "Graph" and bool(self._ensure_gl())
             if (replot and self._graph_kind and (self._graph_kind == "gl") != gpu_next
                     and self.tabs.get() == "Graph" and kwin_blend_available()):
                 kwin_blend(300)
@@ -3016,6 +3358,9 @@ class UltraCalc(ctk.CTk if ctk else object):
             switch.pack_forget()
             if spec["draw"] == "_draw_function":
                 switch.pack(side="left", padx=(10, 0))
+        self.g_join.pack_forget()
+        if spec.get("mesh") == "_mesh_implicit":
+            self.g_join.pack(side="left", padx=(10, 0))
         self.g_info.configure(text=spec["info"], text_color=MUTED)
         if replot:
             self.plot()
@@ -3058,9 +3403,11 @@ class UltraCalc(ctk.CTk if ctk else object):
         gpu = self._graph_kind == "gl"
         filters = ([("PNG image (3D is drawn on the GPU, so it saves as pixels)", "png")] if gpu else
                    [("PNG image", "png"), ("SVG vector image", "svg"), ("PDF document", "pdf")])
+        if self._mesh is not None:  # a 3D shape: offer it as a 3D model first
+            filters.insert(0, ("STL 3D model (Blender, 3D printing, CAD)", "stl"))
         self._dialog_open = True
-        ask_save_path(self, "Save graph", "graph.png", filters, lambda path: self._save_graph(path, gpu),
-                      folder=self._last_save_dir)
+        ask_save_path(self, "Save graph", f"{'model' if self._mesh is not None else 'graph'}.{filters[0][1]}", filters,
+                      lambda path: self._save_graph(path, gpu), folder=self._last_save_dir)
 
     def _save_graph(self, path, gpu):
         self._dialog_open = False
@@ -3068,6 +3415,12 @@ class UltraCalc(ctk.CTk if ctk else object):
             return
         self._last_save_dir = os.path.dirname(path)
         try:
+            if path.lower().endswith(".stl") and self._mesh is not None:
+                vertices, faces = merge_parts(self._mesh)  # every surface into one STL
+                write_stl(path, vertices, faces)
+                self.g_info.configure(text=f"Saved 3D model ({len(faces):,} triangles) to {path}",
+                                      text_color=MUTED)
+                return
             if gpu:
                 import matplotlib.image
                 if not path.lower().endswith(".png"):
@@ -3171,30 +3524,29 @@ class UltraCalc(ctk.CTk if ctk else object):
                 pass
             from vispy import scene
             from vispy.color import get_colormap
-            from vispy.visuals.transforms import STTransform
             canvas = scene.SceneCanvas(app="tkinter", parent=self.g_host, keys=None)
         except Exception:
             self._gl = False
             return None
         g = self._gl = type("Gl", (), {})()
-        g.canvas, g.STTransform, g.colormap = canvas, STTransform, get_colormap("viridis")
+        g.canvas, g.colormap = canvas, get_colormap("viridis")
+        _restore_depth_writes(canvas)
         g.view = canvas.central_widget.add_view()
         g.view.camera = scene.TurntableCamera(fov=40, elevation=28, azimuth=-55, distance=2.4)
-        g.surface = scene.visuals.SurfacePlot(x=np.array([0.0, 1.0]), y=np.array([0.0, 1.0]), z=np.zeros((2, 2)),
-                                              shading="smooth", parent=g.view.scene)
-        g.surface.shading_filter.ambient_light = (1, 1, 1, 0.55)  # keep the colour map readable on the shaded side
-        # wireframe box around the plot, axis captions and a title
-        corners = np.array([[x, y, z] for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.25, 0.25)])
-        edges = [(i, j) for i in range(8) for j in range(i + 1, 8) if bin(i ^ j).count("1") == 1]
-        g.box = scene.visuals.Line(pos=np.array([corners[k] for e in edges for k in e]), connect="segments",
-                                   width=1, parent=g.view.scene)
-        # captions sit just outside the box edges (along x, along y, and up the z corner)
-        g.labels = [scene.visuals.Text("", font_size=9, parent=g.view.scene, pos=p) for p in
-                    ((0, -0.85, -0.3), (0.85, 0, -0.3), (-0.6, -0.6, 0.32))]
-        for label in g.labels:
-            label.set_gl_state("translucent", depth_test=False)  # always readable, never hidden by the surface
+        # near/far = distance ÷/× 10. VisPy's default (÷/× 1000) wastes depth precision on a unit-sized scene,
+        # which made crossing surfaces z-fight into sawtooth edges
+        g.view.camera.depth_value = 100
+        # every 3D mode (height map, (u,v) surface, implicit shape) is drawn as one triangle mesh
+        g.scene, g.meshes = scene, []  # one mesh visual per surface, created on demand (_gl_show_mesh)
+        g.box = scene.visuals.Line(pos=np.zeros((2, 3)), connect="segments", width=1, parent=g.view.scene)
+        # title and the x/y/z ranges sit in the corner, in screen space: captions placed in 3D next to the
+        # box ended up drawn across the shape from most viewing angles
         g.title = scene.visuals.Text("", font_size=11, bold=True, anchor_x="left", anchor_y="center", pos=(14, 20),
                                      parent=canvas.scene, color=GRAPH_COLORS[0])
+        g.caption = scene.visuals.Text("", font_size=9, anchor_x="left", anchor_y="center", pos=(14, 42),
+                                       parent=canvas.scene)
+        for text in (g.title, g.caption):  # drawn last each frame: leave depth writes on (see _restore_depth_writes)
+            text.set_gl_state("translucent", depth_test=False, depth_mask=True)
         return g
 
     def _show_graph_widget(self, kind):
@@ -3208,51 +3560,115 @@ class UltraCalc(ctk.CTk if ctk else object):
         widgets[kind].pack(fill="both", expand=True)
         self._graph_kind = kind
 
-    def _draw_surface_gl(self, c):
+    def _gl_show_mesh(self, c, parts, title, flat_z=False, color_range=None):
+        """Draw the parts fitted into the view (one shared fit), with a box, axis ranges and a title.
+        ``flat_z`` (height maps) squashes z to half the width so landscapes read as landscapes; otherwise
+        shapes keep their true proportions. Opaque surfaces are drawn first; see-through ones after,
+        without hiding what lies behind them."""
         import numpy as np
         g = self._gl
+        lo = np.min([p.vertices.min(axis=0) for p in parts], axis=0)
+        hi = np.max([p.vertices.max(axis=0) for p in parts], axis=0)
+        extent = np.maximum(hi - lo, 1e-12)
+        scale = (np.array([1 / extent[0], 1 / extent[1], 0.5 / extent[2]]) if flat_z
+                 else np.full(3, 1 / extent.max()))
+        z0, z1 = color_range or (lo[2], hi[2])
+        while len(g.meshes) < len(parts):  # one mesh visual per surface, created as needed
+            mesh = g.scene.visuals.Mesh(vertices=np.zeros((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.uint32),
+                                        shading="smooth", parent=g.view.scene)
+            mesh.shading_filter.ambient_light = (1, 1, 1, 0.55)  # keep colours readable on the shaded side
+            g.meshes.append(mesh)
+        old_order = [m.order for m in g.meshes]
+        for mesh, part in zip(g.meshes, parts):
+            if part.vertex_colors is not None:
+                colors = part.vertex_colors
+            elif part.rgba is not None:
+                colors = np.tile(np.array(part.rgba, np.float32), (len(part.vertices), 1))
+            else:  # a lone plain surface: colour by height
+                colors = g.colormap.map(np.clip((part.vertices[:, 2] - z0) / max(z1 - z0, 1e-12), 0, 1))
+                colors[:, 3] = part.alpha
+            see_through = float(np.min(colors[:, 3])) < 1
+            mesh.set_data(vertices=((part.vertices - (lo + hi) / 2) * scale).astype(np.float32), faces=part.faces,
+                          vertex_colors=np.asarray(colors, np.float32))
+            mesh.set_gl_state("translucent", depth_test=True, cull_face=False, depth_mask=not see_through)
+            mesh.order = 1 if see_through else 0
+            mesh.visible = True
+        for mesh in g.meshes[len(parts):]:
+            mesh.visible = False
+        if [m.order for m in g.meshes] != old_order:
+            g.canvas._update_scenegraph(None)  # VisPy caches its draw order and ignores later .order changes
+        hx, hy, hz = extent * scale / 2
+        corners = np.array([[x, y, z] for x in (-hx, hx) for y in (-hy, hy) for z in (-hz, hz)])
+        edges = [(i, j) for i in range(8) for j in range(i + 1, 8) if bin(i ^ j).count("1") == 1]
+        g.box.set_data(pos=np.array([corners[k] for e in edges for k in e]), color=c["grid"])
+        g.caption.text = "      ".join(f"{axis}  {a:.3g} … {b:.3g}" for axis, a, b in zip("xyz", lo, hi))
+        g.caption.color = c["txt"]
+        g.title.text = title
+        g.canvas.bgcolor = c["bg"]
+        g.canvas.update()
+
+    # ---- building the current 3D shape from the inputs (shared by the GPU view, the CPU fallback and STL export)
+    @staticmethod
+    def _parts_title(src, single):
+        styled = styled_parts(src)
+        if len(styled) == 1:
+            return single(styled[0][0])
+        return f"{len(styled)} surfaces: " + ",  ".join(style or f"#{i + 1}" for i, (_, style) in enumerate(styled))
+
+    def _mesh_heightmap(self, coarse=False):
         x0, x1 = self._graph_range("xmin", "xmax", "-8", "8", "x")
         y0, y1 = self._graph_range("ymin", "ymax", repr(x0), repr(x1), "y")
-        src = self._expressions()[0]
-        fn = self.engine.compile(src, params=("x", "y"))
-        n = 100  # the GPU handles 4x the detail the CPU renderer could
-        xs, ys = np.linspace(x0, x1, n), np.linspace(y0, y1, n)
-        Z = np.full((n, n), np.nan)
-        scope = {}
-        with self.engine.angle_mode(False):
-            for i, x in enumerate(xs.tolist()):
-                scope["x"] = x
-                for j, y in enumerate(ys.tolist()):
-                    scope["y"] = y
-                    try:
-                        Z[i, j] = fn.eval(scope)
-                    except (CalcError, OverflowError):
-                        pass
-        finite = Z[np.isfinite(Z)]
-        if not finite.size:
-            raise CalcError("z(x, y) is undefined everywhere in this range")
-        lo, hi = (float(v) for v in np.percentile(finite, [1, 99]))
-        if hi - lo < 1e-9:
-            lo, hi = lo - 1, hi + 1
-        span = hi - lo
-        Z[(Z < lo - span) | (Z > hi + span)] = np.nan  # cut off spikes near asymptotes
-        holes = ~np.isfinite(Z)
-        Z = np.clip(np.where(holes, lo, Z), lo - span * 0.1, hi + span * 0.1)
-        rgba = g.colormap.map(np.clip((Z - lo) / span, 0, 1).ravel()).reshape(n, n, 4)
-        rgba[holes] = (0.35, 0.35, 0.35, 1.0)  # undefined points: neutral grey floor
-        g.surface.set_data(x=xs, y=ys, z=Z)
-        g.surface.mesh_data.set_vertex_colors(rgba.reshape(-1, 4))
-        g.surface.mesh_data_changed()
-        # fit into the box: x and y span [-0.5, 0.5], z spans [-0.25, 0.25]
-        g.surface.transform = g.STTransform(
-            scale=(1 / (x1 - x0), 1 / (y1 - y0), 0.5 / span),
-            translate=(-(x0 + x1) / 2 / (x1 - x0), -(y0 + y1) / 2 / (y1 - y0), -(lo + hi) / 2 * 0.5 / span))
-        g.canvas.bgcolor = c["bg"]
-        g.box.set_data(color=c["grid"])
-        for label, text in zip(g.labels, (f"x  {x0:g} … {x1:g}", f"y  {y0:g} … {y1:g}", f"z  {lo:.3g} … {hi:.3g}")):
-            label.text, label.color = text, c["txt"]
-        g.title.text = f"z = {src}"
-        g.canvas.update()
+        src = self.g_f.get().strip()
+        parts, zrange = heightmap_parts(self.engine, src, x0, x1, y0, y1, n=70 if coarse else 150)
+        return parts, self._parts_title(src, lambda e: "z = " + re.sub(r"^\s*z\s*=\s*", "", e)), zrange
+
+    def _mesh_param_surface(self, coarse=False):
+        u0, u1 = self._graph_range("xmin", "xmax", "0", "2*pi", "u")
+        v0, v1 = self._graph_range("ymin", "ymax", "0", "2*pi", "v")
+        src = self.g_f.get().strip()
+        parts = surface_parts(self.engine, src, u0, u1, v0, v1, n=80 if coarse else 160)
+        return parts, self._parts_title(src, lambda e: f"(x, y, z) = ({e})"), None
+
+    def _mesh_implicit(self, coarse=False):
+        lo, hi = self._graph_range("xmin", "xmax", "-2", "2", "box")
+        detail = int(min(48 if coarse else 128, max(16, self._graph_number("ymin", "72"))))
+        src = self.g_f.get().strip()  # not _expressions(): its "y = …" stripping would eat the equation
+        parts = implicit_parts(self.engine, src, lo, hi, detail, join=bool(self.g_join.get()))
+        return parts, self._parts_title(src, lambda e: e + ("" if "=" in e else " = 0")), None
+
+    def _draw_3d_gl(self, c):
+        parts, title, zrange = getattr(self, GRAPH_MODES[self._g_mode]["mesh"])()
+        self._mesh = parts
+        self._gl_show_mesh(c, parts, title, flat_z=self._g_mode == "3D", color_range=zrange)
+
+    def _draw_3d_mpl(self, ax, c):
+        """CPU fallback for the 3D modes when OpenGL isn't available."""
+        import numpy as np
+        from matplotlib.colors import to_rgba
+        # Matplotlib draws triangles one by one in Python: build coarser meshes to stay responsive
+        parts, title, zrange = getattr(self, GRAPH_MODES[self._g_mode]["mesh"])(coarse=True)
+        self._mesh = parts
+        everything = np.concatenate([p.vertices for p in parts])
+        lo, hi = zrange or (float(everything[:, 2].min()), float(everything[:, 2].max()))
+        for part in parts:
+            v, f = part.vertices, part.faces
+            surface = ax.plot_trisurf(v[:, 0], v[:, 1], v[:, 2], triangles=f, cmap="viridis", vmin=lo, vmax=hi,
+                                      linewidth=0, antialiased=True, alpha=part.alpha)
+            if part.vertex_colors is not None or part.rgba is not None:
+                surface.set_array(None)  # solid or per-part colours instead of the height colour map
+                surface.set_facecolor(part.vertex_colors[f[:, 0]] if part.vertex_colors is not None else part.rgba)
+        if self._g_mode != "3D":
+            ax.set_box_aspect(tuple(everything.max(axis=0) - everything.min(axis=0)))  # true proportions
+        for axis, name in ((ax.xaxis, "x"), (ax.yaxis, "y"), (ax.zaxis, "z")):
+            axis.set_pane_color(to_rgba(c["pane"]))
+            axis._axinfo["grid"]["color"] = to_rgba(c["grid"])
+            axis.label.set_color(c["txt"])
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.tick_params(colors=c["txt"], labelsize=8)
+        self._mpl.fig.text(0.02, 0.97, title, color=GRAPH_COLORS[0], family="monospace",
+                           fontsize=10, fontweight="bold", va="top")
 
     def plot(self):
         self._plot_job = None
@@ -3265,14 +3681,16 @@ class UltraCalc(ctk.CTk if ctk else object):
         colors = (dict(bg="#1c1c1c", grid="#2d2d2d", axis="#9a9a9a", txt="#aaaaaa", pane="#232323") if dark else
                   dict(bg="#ffffff", grid="#e6e6e6", axis="#555555", txt="#555555", pane="#f4f4f4"))
         spec = GRAPH_MODES[self._g_mode]
-        if spec["draw"] == "_draw_surface" and self._ensure_gl():
+        self._mesh = None  # the current 3D shape, kept for STL export
+        if "mesh" in spec and self._ensure_gl():
             self._show_graph_widget("gl")
             self._pl = None
             try:
-                self._draw_surface_gl(colors)
-                self.g_info.configure(text=GRAPH_MODES["3D"]["info"], text_color=MUTED)
-            except CalcError as ex:
-                self.g_info.configure(text=f"⚠ {ex}", text_color=RED)
+                self._draw_3d_gl(colors)
+                self.g_info.configure(text=spec["info"], text_color=MUTED)
+            except (CalcError, RecursionError) as ex:
+                msg = str(ex) if isinstance(ex, CalcError) else "Expression too deeply nested"
+                self.g_info.configure(text=f"⚠ {msg}", text_color=RED)
             return
         self._show_graph_widget("mpl")
         ax = self._mpl_axes(spec["projection"])
@@ -3405,45 +3823,6 @@ class UltraCalc(ctk.CTk if ctk else object):
         ax.axvline(0, color=c["axis"], linewidth=1.0)
         ax.set_aspect("equal", adjustable="datalim")  # a circle should look like a circle
         self._legend(ax)
-
-    def _draw_surface(self, ax, c):
-        import numpy as np
-        from matplotlib.colors import to_rgba
-        x0, x1 = self._graph_range("xmin", "xmax", "-8", "8", "x")
-        y0, y1 = self._graph_range("ymin", "ymax", repr(x0), repr(x1), "y")
-        src = self._expressions()[0]
-        fn = self.engine.compile(src, params=("x", "y"))
-        n = 60
-        X, Y = np.meshgrid(np.linspace(x0, x1, n), np.linspace(y0, y1, n))
-        Z = np.full(X.shape, np.nan)
-        scope = {}
-        with self.engine.angle_mode(False):
-            for idx in np.ndindex(X.shape):
-                scope["x"], scope["y"] = float(X[idx]), float(Y[idx])
-                try:
-                    Z[idx] = float(fn.eval(scope))
-                except (CalcError, OverflowError):
-                    pass
-        finite = Z[np.isfinite(Z)]
-        if not finite.size:
-            raise CalcError("z(x, y) is undefined everywhere in this range")
-        lo, hi = (float(v) for v in np.percentile(finite, [1, 99]))
-        if hi - lo < 1e-9:
-            lo, hi = lo - 1, hi + 1
-        span = hi - lo
-        Z[(Z < lo - span) | (Z > hi + span)] = np.nan  # cut off spikes near asymptotes
-        ax.plot_surface(X, Y, Z, cmap="viridis", vmin=lo, vmax=hi, rstride=1, cstride=1, linewidth=0, antialiased=True)
-        ax.set_zlim(lo - span * 0.1, hi + span * 0.1)
-        for axis, name in ((ax.xaxis, "x"), (ax.yaxis, "y"), (ax.zaxis, "z")):
-            axis.set_pane_color(to_rgba(c["pane"]))
-            axis._axinfo["grid"]["color"] = to_rgba(c["grid"])
-            axis.label.set_color(c["txt"])
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_zlabel("z")
-        ax.tick_params(colors=c["txt"], labelsize=8)
-        self._mpl.fig.text(0.02, 0.97, f"z = {src}", color=GRAPH_COLORS[0], family="monospace",
-                           fontsize=10, fontweight="bold", va="top")
 
     def _y_range(self, series, log=False):
         """y limits: the ymin/ymax fields if given, else the middle 96% of the values plus padding.
