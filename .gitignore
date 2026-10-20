@@ -1,0 +1,6 @@
+.venv/
+.git/
+.github/
+CLAUDE.md
+.vscode/
+.idea/
