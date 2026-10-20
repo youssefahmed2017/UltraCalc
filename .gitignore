@@ -1,7 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
 .venv/
-.git/
-.github/
-CLAUDE.md
+
+# Build output (binaries live in dist/, never in git: GitHub rejects files over 100 MB)
+build/
+dist/
+*.spec
+*.AppImage
+packaging/AppDir/
+
+# Graphs exported from the app
+graph.png
+graph.svg
+graph.pdf
+
+# Editors / local tooling
 .vscode/
 .idea/
-__pycache__/
+CLAUDE.md

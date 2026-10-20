@@ -1,0 +1,7 @@
+customtkinter>=5.2
+matplotlib>=3.8
+numpy>=1.26
+vispy>=0.14
+pyopengltk>=0.0.4
+PyOpenGL>=3.1.7
+jeepney>=0.8; sys_platform == "linux"

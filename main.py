@@ -2,9 +2,9 @@
 UltraCalc - a feature-packed calculator built with customtkinter.
 
 Setup:   pip install customtkinter
-Run:     python mainimp.py                    # GUI
-         python mainimp.py "2^10" "5!=120"    # one-shot, prints results
-         python mainimp.py --repl             # interactive terminal mode
+Run:     python main.py                    # GUI
+         python main.py "2^10" "5!=120"    # one-shot, prints results
+         python main.py --repl             # interactive terminal mode
 
 Highlights
   * Safe expression engine (no eval): + - * / // mod ^ ! % () functions, constants, variables
@@ -14,7 +14,7 @@ Highlights
   * Math Challenge game (solve it / spot right-or-wrong) with streaks
 
 Library use (no GUI needed)
-    >>> from mainimp import Engine, calc
+    >>> from main import Engine, calc
     >>> calc("2^10")
     1024
     >>> eng = Engine()
