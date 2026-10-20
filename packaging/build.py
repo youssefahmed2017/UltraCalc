@@ -22,6 +22,17 @@ ROOT = Path(__file__).resolve().parent.parent
 PKG, DIST, BUILD = ROOT / "packaging", ROOT / "dist", ROOT / "build"
 NAME = "UltraCalc"
 
+# Libraries the AppImage must take from the user's system, not from the (older) build machine.
+# The GPU driver (Mesa) is loaded from the system into our process and links against these; with
+# Ubuntu 22.04's libstdc++ bundled, Arch's Mesa failed to load, there was no OpenGL context and the
+# 3D view showed garbage. The fontconfig/readline ones also leak into programs we run (fc-list, sh).
+# Every desktop Linux ships them.
+LINUX_SYSTEM_LIBS = {
+    "libstdc++", "libgcc_s", "libz", "libzstd", "libexpat", "libffi",
+    "libX11", "libXext", "libXrender", "libXau", "libXdmcp", "libxcb", "libxcb-render", "libxcb-shm",
+    "libfontconfig", "libfreetype", "libglib-2.0", "libpcre", "libbsd", "libmd", "libreadline", "libtinfo", "libncursesw",
+}
+
 
 def pyinstaller(onefile, icon):
     subprocess.run([
@@ -56,6 +67,9 @@ def build_linux():
     shutil.rmtree(appdir, ignore_errors=True)
     (appdir / "usr" / "bin").mkdir(parents=True)
     shutil.move(str(DIST / NAME), appdir / "usr" / "bin" / NAME)
+    for lib in (appdir / "usr" / "bin" / NAME / "_internal").glob("*.so*"):
+        if lib.name.split(".so")[0] in LINUX_SYSTEM_LIBS:  # wheel-private copies (libxcb-9065bb12...) stay
+            lib.unlink()
     apprun = appdir / "AppRun"
     apprun.write_text('#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\n'
                       f'exec "$HERE/usr/bin/{NAME}/{NAME}" "$@"\n')

@@ -3528,6 +3528,18 @@ class UltraCalc(ctk.CTk if ctk else object):
         except Exception:
             self._gl = False
             return None
+        native = canvas.native
+
+        def map_or_fall_back(event, create=native.tkMap):
+            # the OpenGL context is only made when the view first appears; if that fails (e.g. the system's
+            # GPU driver won't load) the canvas would show leftover video memory, so use Matplotlib instead
+            try:
+                create(event)
+            except Exception:
+                for sequence in ("<Map>", "<Configure>", "<Expose>"):
+                    native.unbind(sequence)
+                self.after_idle(self._gl_unavailable)
+        native.bind("<Map>", map_or_fall_back)
         g = self._gl = type("Gl", (), {})()
         g.canvas, g.colormap = canvas, get_colormap("viridis")
         _restore_depth_writes(canvas)
@@ -3548,6 +3560,16 @@ class UltraCalc(ctk.CTk if ctk else object):
         for text in (g.title, g.caption):  # drawn last each frame: leave depth writes on (see _restore_depth_writes)
             text.set_gl_state("translucent", depth_test=False, depth_mask=True)
         return g
+
+    def _gl_unavailable(self):
+        """The OpenGL view got no working context: drop it for good and redraw with Matplotlib."""
+        g, self._gl = self._gl, False
+        if g:
+            g.canvas.native.is_destroyed = True  # VisPy then skips its already-scheduled redraws
+            g.canvas.native.pack_forget()
+        if self._graph_kind == "gl":
+            self._graph_kind = None
+            self._schedule_plot(0)
 
     def _show_graph_widget(self, kind):
         """Show either the Matplotlib widget or the OpenGL one in the graph area."""
